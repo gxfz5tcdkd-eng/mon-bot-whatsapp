@@ -1,57 +1,63 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const http = require('http');
 
-async function connectToWhatsApp() {
+// 1. Petit serveur pour que Render ne redémarre pas le bot
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot WhatsApp est en ligne !');
+}).listen(process.env.PORT || 10000);
+
+async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    const myNumber = process.env.MY_NUMBER;
-
-    if (!myNumber) {
-        console.error("❌ ERREUR : Configure MY_NUMBER sur Render !");
-        process.exit(1);
-    }
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
+        version,
         logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: state,
+        // On utilise un nom de navigateur standard
         browser: ["Ubuntu", "Chrome", "20.0.04"],
     });
 
-    // --- GESTION DU PAIRING CODE AMÉLIORÉE ---
+    // 2. Demande du Pairing Code (On attend que ce soit stable)
     if (!sock.authState.creds.registered) {
-        console.log(`Log : Préparation de la demande pour : ${myNumber}`);
-        
-        // On attend 10 secondes au lieu de 5 pour laisser le temps au serveur de se stabiliser
-        setTimeout(async () => {
+        const phoneNumber = process.env.MY_NUMBER;
+        if (phoneNumber) {
+            console.log(`[LOG] Préparation du code pour : ${phoneNumber}`);
+            // On attend 10 secondes pour laisser la connexion se stabiliser
+            await delay(10000);
             try {
-                // On vérifie si on n'est pas déjà enregistré entre temps
-                if (!sock.authState.creds.registered) {
-                    const code = await sock.requestPairingCode(myNumber);
-                    console.log(`\n======================================`);
-                    console.log(`👉 TON CODE DE CONNEXION : ${code}`);
-                    console.log(`======================================\n`);
-                }
-            } catch (err) {
-                console.error("Erreur Pairing Code (on réessaie dans 10s...)");
-                // Si ça rate, on relance la fonction après un court délai
-                setTimeout(() => connectToWhatsApp(), 10000);
+                const code = await sock.requestPairingCode(phoneNumber);
+                console.log(`\n======================================`);
+                console.log(`👉 TON CODE : ${code}`);
+                console.log(`======================================\n`);
+            } catch (error) {
+                console.error("[ERREUR] Impossible de générer le code :", error.message);
             }
-        }, 10000); 
+        }
     }
+
+    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log("Connexion fermée, tentative de reconnexion...");
-            if (shouldReconnect) connectToWhatsApp();
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            console.log(`[INFO] Connexion fermée (Raison: ${reason})`);
+            
+            // Si ce n'est pas une déconnexion manuelle, on relance après 5s
+            if (reason !== DisconnectReason.loggedOut) {
+                console.log("Tentative de reconnexion dans 5 secondes...");
+                setTimeout(() => startBot(), 5000);
+            }
         } else if (connection === 'open') {
-            console.log('✅ BOT CONNECTÉ ET OPÉRATIONNEL !');
+            console.log('✅ LE BOT EST BIEN CONNECTÉ !');
         }
     });
 
-    sock.ev.on('creds.update', saveCreds);
-
+    // Réponse simple pour tester
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const m = messages[0];
         if (!m.message || m.key.fromMe) return;
@@ -62,4 +68,5 @@ async function connectToWhatsApp() {
     });
 }
 
-connectToWhatsApp();
+// Lancement
+startBot().catch(err => console.error("Erreur critique :", err));
